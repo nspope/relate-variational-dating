@@ -1,0 +1,9 @@
+*.vcf
+*.vcf.gz
+*.anc
+*.anc.gz
+*.mut
+*.mut.gz
+*.dist.gz
+*.trees
+
