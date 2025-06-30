@@ -1,3 +1,7 @@
+.*.swp
+.*.swo
+*.log
+
 *.vcf
 *.vcf.gz
 *.anc
@@ -6,4 +10,5 @@
 *.mut.gz
 *.dist.gz
 *.trees
+*/relate/
 

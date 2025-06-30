@@ -10,6 +10,7 @@ Prototype for variational dating in Relate
 
 import os
 import tskit
+import time
 import glob
 import numpy as np
 import argparse
@@ -45,7 +46,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--relate-dir", 
-    type=str, default="../relate",
+    type=str, default="../relate_v1.2.2_x86_64_static",
     help="Path to relate repo",
 )
 parser.add_argument(
@@ -170,19 +171,23 @@ if __name__ == "__main__":
         for f in glob.glob(f"{input_prefix}*"): os.remove(f)
         for f in glob.glob(f"{output_prefix}*"): os.remove(f)
 
+        # population labels
         sample_names = []
-        for p, ages in enumerate(sample_ages):
-            sample_names.append([
-                f"{p}{i}{'a' if t > 0 else 'c'}" 
-                for i, t in enumerate(ages)
-            ])
+        labels_path = f"{input_prefix}.labels"
+        with open(labels_path, "w") as handle:
+            handle.write(f"sample\tpopulation\tgroup\tsex\n")
+            for i in ts.individuals():
+                p = i.population
+                name = f"{p}{i.id}{'a' if i.time > 0 else 'c'}" 
+                handle.write(f"{name}\t{p}\t{p}\tNA\n")
+                sample_names.append(name)
 
         # vcf
         vcf_path = f"{input_prefix}.vcf"
         ts.write_vcf(
             open(vcf_path, "w"), 
             contig_id=chrom_name, 
-            individual_names=np.concatenate(sample_names),
+            individual_names=sample_names,
         )
 
         # recombination map
@@ -206,19 +211,14 @@ if __name__ == "__main__":
             handle.write(f">{chrom_name}\n")
             handle.write("P" * int(args.sequence_length) + "\n")
 
-        # population labels
-        labels_path = f"{input_prefix}.labels"
-        with open(labels_path, "w") as handle:
-            handle.write(f"sample\tpopulation\tgroup\tsex\n")
-            for p, names in enumerate(sample_names):
-                for name in names:
-                    handle.write(f"{name}\t{p}\t{p}\tNA\n")
-
         # sample ages
+        # NB: these are per haplotype, not per diploid individual
         ages_path = f"{input_prefix}.ages"
         with open(ages_path, "w") as handle:
-            for age in np.concatenate(sample_ages):
-                handle.write(f"{age:.4f}\n")
+            for i in ts.individuals():
+                for s in i.nodes:
+                    age = ts.nodes_time[s]
+                    handle.write(f"{age:.4f}\n")
 
         # prepare inputs
         convert_from_vcf = [
@@ -260,6 +260,7 @@ if __name__ == "__main__":
             "--dist", f"{output_prefix}.dist.gz",
             "--map", f"{input_prefix}.hapmap",
             "--sample_ages", f"{input_prefix}.ages",
+            "--seed", "1024", #f"{relate_seed}",
             "-m", f"{args.mutation_rate}", 
             "-N", f"{Ne}", 
             "-o", f"{chrom_name}",
@@ -286,6 +287,13 @@ if __name__ == "__main__":
     # --- variational dating ---
 
     relate_ts = tskit.load(f"{relate_prefix}.trees")
+    samples = np.array(list(ts.samples()))
+    ancients = samples[ts.nodes_time[samples] > 0]
+    contemporary = samples[ts.nodes_time[samples] == 0]
+    assert np.allclose(relate_ts.nodes_time[ancients], ts.nodes_time[ancients])
+    assert np.allclose(relate_ts.nodes_time[contemporary], 0.0)
+    assert np.allclose(list(relate_ts.samples()), samples)
+
     ep_trees_path = f"{output_path}/ep.trees"
     if not os.path.exists(ep_trees_path) or args.overwrite or args.overwrite_from_ep:
 
@@ -306,9 +314,27 @@ if __name__ == "__main__":
         EP.edge_likelihoods[:, 0] = propagated_edge_muts
         EP.edge_likelihoods[:, 1] = propagated_edge_span * args.mutation_rate
 
-        # run expectation propagation
+        if args.ancients_ages_unknown:
+            # FIXME: think more clearly about the right edge likelihoods to use.
+            # if using the propagated counts, these will bias things because
+            # the ancestral samples span multiple trees, and introduce a coupling.
+            # one crude way to deal with this is to segment the ancestral samples
+            # over trees. A better way would be use the propagated counts on upwards
+            # traversal (without updating child), and unpropagated on downwards traversal
+            # (without updating parent). This could be done with two separate calls
+            # to EP.propagate_likelihood, with a "buffer" posterior for the ancients.
+            EP.node_constraints[ancients, 0] = 0.0
+            EP.node_constraints[ancients, 1] = np.inf
+            #assert False, "not implemented"
+
+        ep_timing = time.time()
         for _ in range(args.ep_iterations):
             EP.iterate(min_step=0.1, max_shape=1000, regularise=args.regularise_roots)
+        ep_timing = time.time() - ep_timing
+        logging.info(
+            f"Node posteriors in {ep_timing:.2f} seconds "
+            f"({ep_timing/args.ep_iterations:.2f} per iter)"
+        )
         
         # rescale using mutational clock, using the tree-by-tree counts/spans
         EP.edge_likelihoods[:] = edge_likelihoods[:]
@@ -321,19 +347,23 @@ if __name__ == "__main__":
             rescale_intervals=args.rescaling_intervals,
         )
         node_ages_mean, node_ages_var = EP.node_moments()
+        constrained_ages = tsdate.util.constrain_ages(relate_ts, node_ages_mean)
+        logging.info(
+            f"Max constraint adjustment: "
+            f"{np.max(constrained_ages - node_ages_mean)}"
+        )
 
         # put new dates into a tree sequence
-        # TODO: this might need constraint with ancient samples
         tab = relate_ts.dump_tables()
         tab.edges.drop_metadata()
         tab.nodes.drop_metadata()
         tab.nodes.metadata_schema = tskit.MetadataSchema.permissive_json()
-        tab.nodes.time = node_ages_mean
+        tab.nodes.time = constrained_ages  # node_ages_mean
         tab.nodes.packset_metadata([
             tab.nodes.metadata_schema.validate_and_encode_row({"mean": m, "var": v})
             for m, v in zip(node_ages_mean, node_ages_var)
         ])
-        tab.mutations.time = node_ages_mean[relate_ts.mutations_node]
+        tab.mutations.time = tab.nodes.time[relate_ts.mutations_node]
         tab.sort()
         tab.build_index()
         tab.compute_mutation_times()
@@ -344,7 +374,7 @@ if __name__ == "__main__":
 
     ep_ts = tskit.load(ep_trees_path)
     plot_path = f"{output_path}/plots"
-    if not os.path.exists(plot_path) or args.overwrite or args.overwrite_from_ep:
+    if True: #not os.path.exists(plot_path) or args.overwrite or args.overwrite_from_ep:
 
         if not os.path.exists(plot_path): os.makedirs(plot_path)
 
@@ -354,6 +384,10 @@ if __name__ == "__main__":
             f"ancients: {','.join([str(x) for x in args.num_ancient])}; "
             f"popsize: {','.join([str(int(x)) for x in args.population_sizes])}; "
         )
+
+        # NB: as ancient samples are set to time zero in the relate tree
+        # sequence, and samples have no assigned population, we need to use the
+        # true sequence to subset
 
         # demographic model
         demesdraw.tubes(demogr.to_demes())
@@ -416,11 +450,16 @@ if __name__ == "__main__":
         plt.savefig(f"{plot_path}/mutation-ages.png")
         plt.clf()
 
-        # pair coalescence rates
+        # pair coalescence rates (contemporary only)
         num_pops = len(args.population_sizes)
         samples = np.array(list(ts.samples()))
         sample_sets = [
-            np.flatnonzero(ts.nodes_population[samples] == i) 
+            np.flatnonzero(
+                np.logical_and(
+                    ts.nodes_population[samples] == i, 
+                    ts.nodes_time[samples] == 0.0,
+                ) 
+            )
             for i in range(num_pops)
         ]
         indexes = [(i, j) for i in range(num_pops) for j in range(i, num_pops)]
@@ -497,7 +536,7 @@ if __name__ == "__main__":
         plt.savefig(f"{plot_path}/pair-rates.png")
         plt.clf()
                             
-        # pair coalescence pdf
+        # pair coalescence pdf (contemporary only)
         rows, cols = num_pops, num_pops
         fig, axs = plt.subplots(
             rows, cols, figsize=(cols * 3.5, rows * 3),
@@ -511,15 +550,15 @@ if __name__ == "__main__":
                     axs[i, j].set_visible(False)
                 else:
                     axs[i, j].step(
-                        time_grid[:cutoff], true_pdf[k][:cutoff], 
+                        time_grid[:-1], true_pdf[k], 
                         where="post", label="true", color="black",
                     )
                     axs[i, j].step(
-                        time_grid[:cutoff], relate_pdf[k][:cutoff], alpha=0.5,
+                        time_grid[:-1], relate_pdf[k], alpha=0.5,
                         where="post", label="mcmc", color="red",
                     )
                     axs[i, j].step(
-                        time_grid[:cutoff], ep_pdf[k][:cutoff], alpha=0.5,
+                        time_grid[:-1], ep_pdf[k], alpha=0.5,
                         where="post", label="ep", color="blue",
                     )
                     axs[i, j].set_title(f"pop{i} v. pop{j}", size=10)
@@ -531,4 +570,72 @@ if __name__ == "__main__":
         fig.suptitle(simulation_info, size=10)
         plt.savefig(f"{plot_path}/pair-pdf.png")
         plt.clf()
+
+        # expected vs observed SFS (contemporary only)
+        rows, cols = 2, num_pops
+        fig, axs = plt.subplots(
+            rows, cols, figsize=(cols * 3.5, rows * 3),
+            constrained_layout=True, sharex=False, sharey="row",
+            squeeze=False,
+        )
+        samples = np.array(list(relate_ts.samples()))
+        for i in range(num_pops):
+            subset = samples[np.logical_and(
+                ts.nodes_time[samples] == 0.0,
+                ts.nodes_population[samples] == i,
+            )]
+            obs_sfs = relate_ts.allele_frequency_spectrum(
+                sample_sets=[subset],
+                mode='site',
+                polarised=True,
+            )
+            relate_sfs = relate_ts.allele_frequency_spectrum(
+                sample_sets=[subset],
+                mode='branch',
+                polarised=True,
+            ) * args.mutation_rate
+            ep_sfs = ep_ts.allele_frequency_spectrum(
+                sample_sets=[subset],
+                mode='branch',
+                polarised=True,
+            ) * args.mutation_rate
+            
+            # raw values
+            axs[0, i].plot(
+                np.arange(1, subset.size), obs_sfs[1:-1], "-o", 
+                color="black", label="site", markersize=2,
+            )
+            axs[0, i].plot(
+                np.arange(1, subset.size), relate_sfs[1:-1], "-o", 
+                color="red", label="mcmc", markersize=2, alpha=0.2,
+            )
+            axs[0, i].plot(
+                np.arange(1, subset.size), ep_sfs[1:-1], "-o", 
+                color="blue", label="ep", markersize=4, alpha=0.2,
+            )
+            axs[0, i].set_yscale("log")
+            axs[0, i].legend()
+
+            # residuals
+            resid = np.log10(relate_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
+            axs[1, i].plot(
+                np.arange(1, subset.size), resid, "-o", 
+                color="red", label="mcmc", markersize=2, alpha=0.2,
+            )
+            resid = np.log10(ep_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
+            axs[1, i].plot(
+                np.arange(1, subset.size), resid, "-o", 
+                color="blue", label="ep", markersize=4, alpha=0.2,
+            )
+            axs[1, i].axhline(y=0.0, linestyle="dashed", color="black")
+            axs[1, i].legend()
+        fig.supxlabel("Mutation frequency", size=10)
+        axs[0, 0].set_ylabel("# mutations", size=10)
+        axs[1, 0].set_ylabel("residual (log10)", size=10)
+        fig.suptitle(simulation_info, size=10)
+        plt.savefig(f"{plot_path}/site-vs-branch-sfs.png")
+        plt.clf()
+
+
+
 
