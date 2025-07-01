@@ -708,6 +708,7 @@ if __name__ == "__main__":
         time_windows[:-1]/2 + time_windows[1:]/2, relate_obs, 
         "-o", color="blue", markersize=2, alpha=0.5, label="site",
     )
+    axs[0, 0].legend()
     axs[0, 0].set_xscale("log")
 
     axs[0, 1].set_title("EP")
@@ -723,6 +724,7 @@ if __name__ == "__main__":
         time_windows[:-1]/2 + time_windows[1:]/2, ep_obs, 
         "-o", color="blue", markersize=2, alpha=0.5, label="site",
     )
+    axs[0, 1].legend()
     axs[0, 1].set_xscale("log")
 
     fig.supylabel("# segregating sites")

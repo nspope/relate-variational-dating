@@ -1,8 +1,8 @@
-python date-island-model.py \
-  --relate-dir ../relate \
-  --relate-lib-dir ../relate_lib \
-  --output-dir ./island-model &>island-model.log
-
+#python date-island-model.py \
+#  --relate-dir ../relate \
+#  --relate-lib-dir ../relate_lib \
+#  --output-dir ./island-model &>island-model.log
+#
 #python date-island-model.py \
 #  --relate-dir ../relate \
 #  --relate-lib-dir ../relate_lib \
@@ -22,10 +22,10 @@ python date-island-model.py \
 #  --num-ancient 125 125 \
 #  --ancients-ages-unknown \
 #  --output-dir ./island-model-dateanc &>>island-model-dateanc.log
-#
-#python date-island-model.py \
-#  --relate-dir ../relate \
-#  --relate-lib-dir ../relate_lib \
-#  --num-contemporary 125 125 \
-#  --num-ancient 125 125 \
-#  --output-dir ./island-model-fixanc &>island-model-fixanc.log
+
+python date-island-model.py \
+  --relate-dir ../relate \
+  --relate-lib-dir ../relate_lib \
+  --num-contemporary 125 125 \
+  --num-ancient 125 125 \
+  --output-dir ./island-model-fixanc &>island-model-fixanc.log
