@@ -1,9 +1,7 @@
 python date-island-model.py \
   --relate-dir ../relate \
   --relate-lib-dir ../relate_lib \
-  --ep-iterations 25 \
-  --overwrite-from-ep \
-  --output-dir ./island-model &>>island-model.log
+  --output-dir ./island-model &>island-model.log
 
 #python date-island-model.py \
 #  --relate-dir ../relate \

@@ -21,7 +21,10 @@ import demesdraw
 from sys import stdout, stderr
 import matplotlib.pyplot as plt
 
+from lib.util import mutation_freq_and_midpoint_age, time_windowed_segregating_sites
+
 logging.basicConfig(level=logging.INFO)
+
 
 parser = argparse.ArgumentParser(docstring)
 parser.add_argument(
@@ -78,26 +81,11 @@ parser.add_argument("--overwrite", action="store_true")
 parser.add_argument("--overwrite-from-ep", action="store_true")
 parser.add_argument("--ep-iterations", type=int, default=5)
 parser.add_argument("--regularise-roots", action="store_true")
+parser.add_argument("--use-prior", action="store_true")
+parser.add_argument("--use-relate-ages", action="store_true")
 parser.add_argument("--rescaling-iterations", type=int, default=5)
 parser.add_argument("--rescaling-intervals", type=int, default=1000)
 parser.add_argument("--rate-intervals", type=int, default=25)
-
-
-def mutation_freq_and_midpoint_age(ts, positions):
-    position_map = {p: i for i, p in enumerate(positions)}
-    mutation_age = np.full(positions.size, np.nan)
-    mutation_frq = np.full(positions.size, np.nan)
-    sites_mutations = np.bincount(ts.mutations_site, minlength=ts.num_sites)
-    sites_mutations = {p: n for p, n in zip(ts.sites_position, sites_mutations)}
-    for t in ts.trees():
-        for m in t.mutations():
-            if m.edge != -1:
-                p = ts.sites_position[m.site]
-                if p in position_map and sites_mutations[p] == 1:
-                    i = position_map[p]
-                    mutation_age[i] = (t.time(t.parent(m.node)) + t.time(m.node)) / 2
-                    mutation_frq[i] = t.num_samples(m.node)
-    return mutation_frq, mutation_age
 
 
 if __name__ == "__main__":
@@ -298,7 +286,49 @@ if __name__ == "__main__":
     if not os.path.exists(ep_trees_path) or args.overwrite or args.overwrite_from_ep:
 
         import tsdate
+
         EP = tsdate.variational.ExpectationPropagation(relate_ts, mutation_rate=args.mutation_rate)
+
+        # initialize with coalescent prior
+        # TODO: should reduce down to contemporary
+        def conditional_coalescent(num_tips):
+            coal_rates = np.array(
+                [2 / (i * (i - 1)) if i > 1 else 0.0 for i in range(1, num_tips + 1)]
+            )
+            mean = coal_rates.copy()
+            variance = coal_rates.copy() ** 2
+            for i in range(coal_rates.size - 2, 0, -1):
+                mean[i] += mean[i + 1]
+                variance[i] += variance[i + 1]
+            moments = tsdate.prior._marginalize_over_ancestors(np.stack((mean, variance + mean**2), 1))
+            moments[:, 1] -= moments[:, 0] ** 2
+            return moments
+
+        if args.use_prior:
+            Ne = relate_ts.diversity() / args.mutation_rate  # haploid Ne
+            prior_moments = conditional_coalescent(relate_ts.num_samples)
+            prior_moments[:, 0] *= Ne
+            prior_moments[:, 1] *= Ne ** 2
+            node_prior = np.zeros((relate_ts.num_nodes, 2))
+            for t in relate_ts.trees():
+                for n in t.nodes():
+                    num_samples = t.num_samples(n)
+                    #if num_samples == relate_ts.num_samples:  # roots only
+                    if num_samples > 1:
+                        # note this is natural not canonical parameterization of gamma
+                        node_prior[n] = \
+                            tsdate.approx.approximate_gamma_mom(*prior_moments[num_samples])
+            EP.node_posterior[:] = node_prior[:]
+
+        if args.use_relate_ages:
+            # this should only ever be done if skipping EP entirely, so:
+            args.ep_iterations = 0
+            node_prior = np.zeros((relate_ts.num_nodes, 2))
+            for n in range(relate_ts.num_samples, relate_ts.num_nodes):
+                node_prior[n] = \
+                    tsdate.approx.approximate_gamma_mom(relate_ts.nodes_time[n], 1)
+                # variance is arbitrary
+            EP.node_posterior[:] = node_prior[:]
         
         # calculate "extended" SNP counts/edge spans from relate
         edge_meta = np.stack(
@@ -325,19 +355,19 @@ if __name__ == "__main__":
             # to EP.propagate_likelihood, with a "buffer" posterior for the ancients.
             EP.node_constraints[ancients, 0] = 0.0
             EP.node_constraints[ancients, 1] = np.inf
-            #assert False, "not implemented"
+            assert False, "not implemented"
 
         ep_timing = time.time()
         for _ in range(args.ep_iterations):
+            # TODO: use rescaling per iter here, to adjust mutation rate?
+            # edge_adj = edge_mutation_rate_adjustment(node_times_from_ep, relate_ts)
+            # EP.edge_likelihoods[:, 1] *= edge_adj
             EP.iterate(min_step=0.1, max_shape=1000, regularise=args.regularise_roots)
         ep_timing = time.time() - ep_timing
-        logging.info(
-            f"Node posteriors in {ep_timing:.2f} seconds "
-            f"({ep_timing/args.ep_iterations:.2f} per iter)"
-        )
+        logging.info(f"Node posteriors in {ep_timing:.2f} seconds")
         
         # rescale using mutational clock, using the tree-by-tree counts/spans
-        EP.edge_likelihoods[:] = edge_likelihoods[:]
+        EP.edge_likelihoods[:] = edge_likelihoods[:] #DEBUG
         EP.infer(
             ep_iterations=0, 
             max_shape=1000, 
@@ -374,268 +404,329 @@ if __name__ == "__main__":
 
     ep_ts = tskit.load(ep_trees_path)
     plot_path = f"{output_path}/plots"
-    if True: #not os.path.exists(plot_path) or args.overwrite or args.overwrite_from_ep:
 
-        if not os.path.exists(plot_path): os.makedirs(plot_path)
+    if not os.path.exists(plot_path): os.makedirs(plot_path)
 
-        simulation_info = (
-            f"seqlen: {args.sequence_length/1e6:.1f}Mb; "
-            f"samples: {','.join([str(x) for x in args.num_contemporary])}; "
-            f"ancients: {','.join([str(x) for x in args.num_ancient])}; "
-            f"popsize: {','.join([str(int(x)) for x in args.population_sizes])}; "
-        )
+    simulation_info = (
+        f"seqlen: {args.sequence_length/1e6:.1f}Mb; "
+        f"samples: {','.join([str(x) for x in args.num_contemporary])}; "
+        f"ancients: {','.join([str(x) for x in args.num_ancient])}; "
+        f"popsize: {','.join([str(int(x)) for x in args.population_sizes])}; "
+    )
 
-        # NB: as ancient samples are set to time zero in the relate tree
-        # sequence, and samples have no assigned population, we need to use the
-        # true sequence to subset
+    # (1) demographic model
+    demesdraw.tubes(demogr.to_demes())
+    plt.savefig(f"{plot_path}/demography.png")
+    plt.clf()
 
-        # demographic model
-        demesdraw.tubes(demogr.to_demes())
-        plt.savefig(f"{plot_path}/demography.png")
-        plt.clf()
+    # (2) mutation age estimates versus true ages
+    true_mutation_freq, true_mutation_ages = \
+        mutation_freq_and_midpoint_age(ts, relate_ts.sites_position)
+    relate_mutation_freq, relate_mutation_ages = \
+        mutation_freq_and_midpoint_age(relate_ts, relate_ts.sites_position)
+    ep_mutation_freq, ep_mutation_ages = \
+        mutation_freq_and_midpoint_age(ep_ts, relate_ts.sites_position)
 
-        # mutation age estimates versus true ages
-        true_mutation_freq, true_mutation_ages = \
-            mutation_freq_and_midpoint_age(ts, relate_ts.sites_position)
-        relate_mutation_freq, relate_mutation_ages = \
-            mutation_freq_and_midpoint_age(relate_ts, relate_ts.sites_position)
-        ep_mutation_freq, ep_mutation_ages = \
-            mutation_freq_and_midpoint_age(ep_ts, relate_ts.sites_position)
+    rows, cols = 1, 2
+    fig, axs = plt.subplots(
+        rows, cols, figsize=(cols * 3, rows * 3),
+        constrained_layout=True, sharex=True, sharey=True,
+        squeeze=False,
+    )
+    mx = np.nanmean(true_mutation_ages)
 
-        rows, cols = 1, 2
-        fig, axs = plt.subplots(
-            rows, cols, figsize=(cols * 3, rows * 3),
-            constrained_layout=True, sharex=True, sharey=True,
-            squeeze=False,
-        )
-        mx = np.nanmean(true_mutation_ages)
+    axs[0, 0].set_title("MCMC", size=10)
+    axs[0, 0].hexbin(
+        true_mutation_ages, relate_mutation_ages, 
+        xscale="log", yscale="log", mincnt=1,
+    )
+    axs[0, 0].axline(
+        (mx, mx), (mx + 1, mx + 1), 
+        linestyle="dashed", color="red",
+    )
+    mse = np.nanmean((np.log10(true_mutation_ages) - np.log10(relate_mutation_ages)) ** 2)
+    bias = np.nanmean(-(np.log10(true_mutation_ages) - np.log10(relate_mutation_ages)))
+    axs[0, 0].text(
+        0.01, 0.99, f"mse: {mse:.3f}\nbias: {bias:.3f}",
+        transform=axs[0, 0].transAxes,
+        size=10, ha="left", va="top",
+    )
 
-        axs[0, 0].set_title("MCMC", size=10)
-        axs[0, 0].hexbin(
-            true_mutation_ages, relate_mutation_ages, 
-            xscale="log", yscale="log", mincnt=1,
-        )
-        axs[0, 0].axline(
-            (mx, mx), (mx + 1, mx + 1), 
-            linestyle="dashed", color="red",
-        )
-        mse = np.nanmean((np.log10(true_mutation_ages) - np.log10(relate_mutation_ages)) ** 2)
-        bias = np.nanmean(-(np.log10(true_mutation_ages) - np.log10(relate_mutation_ages)))
-        axs[0, 0].text(
-            0.01, 0.99, f"mse: {mse:.3f}\nbias: {bias:.3f}",
-            transform=axs[0, 0].transAxes,
-            size=10, ha="left", va="top",
-        )
+    axs[0, 1].set_title("EP", size=10)
+    axs[0, 1].hexbin(
+        true_mutation_ages, ep_mutation_ages, 
+        xscale="log", yscale="log", mincnt=1,
+    )
+    axs[0, 1].axline(
+        (mx, mx), (mx + 1, mx + 1), 
+        linestyle="dashed", color="red",
+    )
+    mse = np.nanmean((np.log10(true_mutation_ages) - np.log10(ep_mutation_ages)) ** 2)
+    bias = np.nanmean(-(np.log10(true_mutation_ages) - np.log10(ep_mutation_ages)))
+    axs[0, 1].text(
+        0.01, 0.99, f"mse: {mse:.3f}\nbias: {bias:.3f}",
+        transform=axs[0, 1].transAxes,
+        size=10, ha="left", va="top",
+    )
 
-        axs[0, 1].set_title("EP", size=10)
-        axs[0, 1].hexbin(
-            true_mutation_ages, ep_mutation_ages, 
-            xscale="log", yscale="log", mincnt=1,
-        )
-        axs[0, 1].axline(
-            (mx, mx), (mx + 1, mx + 1), 
-            linestyle="dashed", color="red",
-        )
-        mse = np.nanmean((np.log10(true_mutation_ages) - np.log10(ep_mutation_ages)) ** 2)
-        bias = np.nanmean(-(np.log10(true_mutation_ages) - np.log10(ep_mutation_ages)))
-        axs[0, 1].text(
-            0.01, 0.99, f"mse: {mse:.3f}\nbias: {bias:.3f}",
-            transform=axs[0, 1].transAxes,
-            size=10, ha="left", va="top",
-        )
+    fig.suptitle(simulation_info, size=10)
+    fig.supylabel("Estimated mutation age", size=10)
+    fig.supxlabel("True mutation age", size=10)
+    plt.savefig(f"{plot_path}/mutation-ages.png")
+    plt.clf()
 
-        fig.suptitle(simulation_info, size=10)
-        fig.supylabel("Estimated mutation age", size=10)
-        fig.supxlabel("True mutation age", size=10)
-        plt.savefig(f"{plot_path}/mutation-ages.png")
-        plt.clf()
-
-        # pair coalescence rates (contemporary only)
-        num_pops = len(args.population_sizes)
-        samples = np.array(list(ts.samples()))
-        sample_sets = [
-            np.flatnonzero(
-                np.logical_and(
-                    ts.nodes_population[samples] == i, 
-                    ts.nodes_time[samples] == 0.0,
-                ) 
-            )
-            for i in range(num_pops)
-        ]
-        indexes = [(i, j) for i in range(num_pops) for j in range(i, num_pops)]
-        time_grid = np.logspace(2, 6, args.rate_intervals + 1)
-        time_grid[0] = 0.0
-        time_grid[-1] = np.inf
-        true_pdf = ts.pair_coalescence_counts(
-            sample_sets=sample_sets,
-            indexes=indexes,
-            time_windows=time_grid, 
-            pair_normalise=True,
-        )
-        relate_pdf = relate_ts.pair_coalescence_counts(
-            sample_sets=sample_sets,
-            indexes=indexes,
-            time_windows=time_grid, 
-            pair_normalise=True,
-        )
-        ep_pdf = ep_ts.pair_coalescence_counts(
-            sample_sets=sample_sets,
-            indexes=indexes,
-            time_windows=time_grid, 
-            pair_normalise=True,
-        )
-        true_rates = ts.pair_coalescence_rates(
-            time_windows=time_grid,
-            sample_sets=sample_sets,
-            indexes=indexes,
-        ) 
-        relate_rates = relate_ts.pair_coalescence_rates(
-            time_windows=time_grid, 
-            sample_sets=sample_sets,
-            indexes=indexes,
-        )
-        ep_rates = ep_ts.pair_coalescence_rates(
-            time_windows=time_grid, 
-            sample_sets=sample_sets,
-            indexes=indexes,
-        )
-        cutoff = np.argmax(np.cumsum(true_pdf) > 0.99) + 1
-
-        rows, cols = num_pops, num_pops
-        fig, axs = plt.subplots(
-            rows, cols, figsize=(cols * 3.5, rows * 3),
-            constrained_layout=True, sharex=True, sharey=False,
-            squeeze=False,
-        )
-        k = 0
-        for i in range(num_pops):
-            for j in range(num_pops):
-                if i > j:
-                    axs[i, j].set_visible(False)
-                else:
-                    axs[i, j].step(
-                        time_grid[:cutoff], true_rates[k][:cutoff], 
-                        where="post", label="true", color="black",
-                    )
-                    axs[i, j].step(
-                        time_grid[:cutoff], relate_rates[k][:cutoff], alpha=0.5,
-                        where="post", label="mcmc", color="red",
-                    )
-                    axs[i, j].step(
-                        time_grid[:cutoff], ep_rates[k][:cutoff], alpha=0.5,
-                        where="post", label="ep", color="blue",
-                    )
-                    axs[i, j].set_title(f"pop{i} v. pop{j}", size=10)
-                    axs[i, j].legend()
-                    axs[i, j].set_xscale("log")
-                    axs[i, j].set_yscale("log")
-                    k += 1
-        fig.supxlabel("Time ago", size=10)
-        fig.supylabel("Pair coalescence rate", size=10)
-        fig.suptitle(simulation_info, size=10)
-        plt.savefig(f"{plot_path}/pair-rates.png")
-        plt.clf()
-                            
-        # pair coalescence pdf (contemporary only)
-        rows, cols = num_pops, num_pops
-        fig, axs = plt.subplots(
-            rows, cols, figsize=(cols * 3.5, rows * 3),
-            constrained_layout=True, sharex=True, sharey=False,
-            squeeze=False,
-        )
-        k = 0
-        for i in range(num_pops):
-            for j in range(num_pops):
-                if i > j:
-                    axs[i, j].set_visible(False)
-                else:
-                    axs[i, j].step(
-                        time_grid[:-1], true_pdf[k], 
-                        where="post", label="true", color="black",
-                    )
-                    axs[i, j].step(
-                        time_grid[:-1], relate_pdf[k], alpha=0.5,
-                        where="post", label="mcmc", color="red",
-                    )
-                    axs[i, j].step(
-                        time_grid[:-1], ep_pdf[k], alpha=0.5,
-                        where="post", label="ep", color="blue",
-                    )
-                    axs[i, j].set_title(f"pop{i} v. pop{j}", size=10)
-                    axs[i, j].legend()
-                    axs[i, j].set_xscale("log")
-                    k += 1
-        fig.supxlabel("Time ago", size=10)
-        fig.supylabel("Proportion coalescing pairs", size=10)
-        fig.suptitle(simulation_info, size=10)
-        plt.savefig(f"{plot_path}/pair-pdf.png")
-        plt.clf()
-
-        # expected vs observed SFS (contemporary only)
-        rows, cols = 2, num_pops
-        fig, axs = plt.subplots(
-            rows, cols, figsize=(cols * 3.5, rows * 3),
-            constrained_layout=True, sharex=False, sharey="row",
-            squeeze=False,
-        )
-        samples = np.array(list(relate_ts.samples()))
-        for i in range(num_pops):
-            subset = samples[np.logical_and(
+    # (3) pair coalescence rates (contemporary samples only)
+    num_pops = len(args.population_sizes)
+    samples = np.array(list(ts.samples()))
+    sample_sets = [
+        np.flatnonzero(
+            np.logical_and(
+                ts.nodes_population[samples] == i, 
                 ts.nodes_time[samples] == 0.0,
-                ts.nodes_population[samples] == i,
-            )]
-            obs_sfs = relate_ts.allele_frequency_spectrum(
-                sample_sets=[subset],
-                mode='site',
-                polarised=True,
-            )
-            relate_sfs = relate_ts.allele_frequency_spectrum(
-                sample_sets=[subset],
-                mode='branch',
-                polarised=True,
-            ) * args.mutation_rate
-            ep_sfs = ep_ts.allele_frequency_spectrum(
-                sample_sets=[subset],
-                mode='branch',
-                polarised=True,
-            ) * args.mutation_rate
-            
-            # raw values
-            axs[0, i].plot(
-                np.arange(1, subset.size), obs_sfs[1:-1], "-o", 
-                color="black", label="site", markersize=2,
-            )
-            axs[0, i].plot(
-                np.arange(1, subset.size), relate_sfs[1:-1], "-o", 
-                color="red", label="mcmc", markersize=2, alpha=0.2,
-            )
-            axs[0, i].plot(
-                np.arange(1, subset.size), ep_sfs[1:-1], "-o", 
-                color="blue", label="ep", markersize=4, alpha=0.2,
-            )
-            axs[0, i].set_yscale("log")
-            axs[0, i].legend()
+            ) 
+        )
+        for i in range(num_pops)
+    ]
+    indexes = [(i, j) for i in range(num_pops) for j in range(i, num_pops)]
+    time_grid = np.logspace(2, 6, args.rate_intervals + 1)
+    time_grid[0] = 0.0
+    time_grid[-1] = np.inf
+    true_pdf = ts.pair_coalescence_counts(
+        sample_sets=sample_sets,
+        indexes=indexes,
+        time_windows=time_grid, 
+        pair_normalise=True,
+    )
+    relate_pdf = relate_ts.pair_coalescence_counts(
+        sample_sets=sample_sets,
+        indexes=indexes,
+        time_windows=time_grid, 
+        pair_normalise=True,
+    )
+    ep_pdf = ep_ts.pair_coalescence_counts(
+        sample_sets=sample_sets,
+        indexes=indexes,
+        time_windows=time_grid, 
+        pair_normalise=True,
+    )
+    true_rates = ts.pair_coalescence_rates(
+        time_windows=time_grid,
+        sample_sets=sample_sets,
+        indexes=indexes,
+    ) 
+    relate_rates = relate_ts.pair_coalescence_rates(
+        time_windows=time_grid, 
+        sample_sets=sample_sets,
+        indexes=indexes,
+    )
+    ep_rates = ep_ts.pair_coalescence_rates(
+        time_windows=time_grid, 
+        sample_sets=sample_sets,
+        indexes=indexes,
+    )
+    cutoff = np.argmax(np.cumsum(true_pdf) > 0.99) + 1
 
-            # residuals
-            resid = np.log10(relate_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
-            axs[1, i].plot(
-                np.arange(1, subset.size), resid, "-o", 
-                color="red", label="mcmc", markersize=2, alpha=0.2,
-            )
-            resid = np.log10(ep_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
-            axs[1, i].plot(
-                np.arange(1, subset.size), resid, "-o", 
-                color="blue", label="ep", markersize=4, alpha=0.2,
-            )
-            axs[1, i].axhline(y=0.0, linestyle="dashed", color="black")
-            axs[1, i].legend()
-        fig.supxlabel("Mutation frequency", size=10)
-        axs[0, 0].set_ylabel("# mutations", size=10)
-        axs[1, 0].set_ylabel("residual (log10)", size=10)
-        fig.suptitle(simulation_info, size=10)
-        plt.savefig(f"{plot_path}/site-vs-branch-sfs.png")
-        plt.clf()
+    rows, cols = num_pops, num_pops
+    fig, axs = plt.subplots(
+        rows, cols, figsize=(cols * 4, rows * 3),
+        constrained_layout=True, sharex=True, sharey=False,
+        squeeze=False,
+    )
+    k = 0
+    for i in range(num_pops):
+        for j in range(num_pops):
+            if i > j:
+                axs[i, j].set_visible(False)
+            else:
+                axs[i, j].step(
+                    time_grid[:cutoff], true_rates[k][:cutoff], 
+                    where="post", label="true", color="black",
+                )
+                axs[i, j].step(
+                    time_grid[:cutoff], relate_rates[k][:cutoff], alpha=0.5,
+                    where="post", label="mcmc", color="red",
+                )
+                axs[i, j].step(
+                    time_grid[:cutoff], ep_rates[k][:cutoff], alpha=0.5,
+                    where="post", label="ep", color="blue",
+                )
+                axs[i, j].set_title(f"pop{i} v. pop{j}", size=10)
+                axs[i, j].legend()
+                axs[i, j].set_xscale("log")
+                axs[i, j].set_yscale("log")
+                k += 1
+    fig.supxlabel("Time ago", size=10)
+    fig.supylabel("Pair coalescence rate", size=10)
+    fig.suptitle(simulation_info, size=10)
+    plt.savefig(f"{plot_path}/pair-rates.png")
+    plt.clf()
+                        
+    # (4) pair coalescence pdf (contemporary samples only)
+    rows, cols = num_pops, num_pops
+    fig, axs = plt.subplots(
+        rows, cols, figsize=(cols * 4, rows * 3),
+        constrained_layout=True, sharex=True, sharey=False,
+        squeeze=False,
+    )
+    k = 0
+    for i in range(num_pops):
+        for j in range(num_pops):
+            if i > j:
+                axs[i, j].set_visible(False)
+            else:
+                axs[i, j].step(
+                    time_grid[:-1], true_pdf[k], 
+                    where="post", label="true", color="black",
+                )
+                axs[i, j].step(
+                    time_grid[:-1], relate_pdf[k], alpha=0.5,
+                    where="post", label="mcmc", color="red",
+                )
+                axs[i, j].step(
+                    time_grid[:-1], ep_pdf[k], alpha=0.5,
+                    where="post", label="ep", color="blue",
+                )
+                axs[i, j].set_title(f"pop{i} v. pop{j}", size=10)
+                axs[i, j].legend()
+                axs[i, j].set_xscale("log")
+                k += 1
+    fig.supxlabel("Time ago", size=10)
+    fig.supylabel("Proportion coalescing pairs", size=10)
+    fig.suptitle(simulation_info, size=10)
+    plt.savefig(f"{plot_path}/pair-pdf.png")
+    plt.clf()
 
+    # (5) expected vs observed SFS (contemporary samples only)
+    samples = np.array(list(relate_ts.samples()))
+    subset = samples[relate_ts.nodes_time[samples] == 0.0]
+    obs_sfs = relate_ts.allele_frequency_spectrum(
+        sample_sets=[subset],
+        mode='site',
+        polarised=True,
+    )
+    relate_sfs = relate_ts.allele_frequency_spectrum(
+        sample_sets=[subset],
+        mode='branch',
+        polarised=True,
+    ) * args.mutation_rate
+    ep_sfs = ep_ts.allele_frequency_spectrum(
+        sample_sets=[subset],
+        mode='branch',
+        polarised=True,
+    ) * args.mutation_rate
 
+    rows, cols = 2, 2
+    fig, axs = plt.subplots(
+        rows, cols, figsize=(cols * 5, rows * 3),
+        constrained_layout=True, sharex=True, sharey="row",
+        squeeze=False,
+    )
+    
+    axs[0, 0].set_title("MCMC")
+    axs[0, 0].plot(
+        np.arange(1, subset.size), obs_sfs[1:-1], "-o", 
+        color="gray", label="observed", markersize=2,
+    )
+    axs[0, 0].plot(
+        np.arange(1, subset.size), relate_sfs[1:-1], "-o", 
+        color="red", label="expected", markersize=2, alpha=0.5,
+    )
+    axs[0, 0].set_yscale("log")
+    axs[0, 0].set_ylabel("# mutations", size=10)
+    axs[0, 0].legend()
 
+    axs[0, 1].set_title("EP")
+    axs[0, 1].plot(
+        np.arange(1, subset.size), obs_sfs[1:-1], "-o", 
+        color="gray", label="observed", markersize=2,
+    )
+    axs[0, 1].plot(
+        np.arange(1, subset.size), ep_sfs[1:-1], "-o", 
+        color="blue", label="expected", markersize=2, alpha=0.5,
+    )
+    axs[0, 1].set_yscale("log")
+    axs[0, 1].legend()
 
+    resid = np.log10(relate_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
+    axs[1, 0].plot(
+        np.arange(1, subset.size), resid, "-o", 
+        color="red", label="mcmc", markersize=2,
+    )
+    axs[1, 0].axhline(y=0.0, linestyle="dashed", color="black")
+    axs[1, 0].set_ylabel("residual (log10)", size=10)
+
+    resid = np.log10(ep_sfs[1:-1]) - np.log10(obs_sfs[1:-1])
+    axs[1, 1].plot(
+        np.arange(1, subset.size), resid, "-o", 
+        color="blue", label="ep", markersize=2,
+    )
+    axs[1, 1].axhline(y=0.0, linestyle="dashed", color="black")
+
+    fig.supxlabel("Mutation frequency", size=10)
+    fig.suptitle(simulation_info, size=10)
+    plt.savefig(f"{plot_path}/site-vs-branch-sfs.png")
+    plt.clf()
+
+    # (6) segregating sites over time
+    max_time = max(relate_ts.nodes_time.max(), ep_ts.nodes_time.max())
+    time_windows = np.logspace(2, 6, 101)
+    time_windows = time_windows[time_windows < max_time]
+    time_windows[-1] = max_time + 1
+
+    true_obs = np.bincount(
+        np.digitize(ts.mutations_time, time_windows), 
+        minlength=time_windows.size + 1,
+    )[1:-1]
+    relate_obs, relate_exp = time_windowed_segregating_sites(
+        relate_ts, 
+        time_windows, 
+        mutation_rate=args.mutation_rate,
+    )
+    ep_obs, ep_exp = time_windowed_segregating_sites(
+        ep_ts, 
+        time_windows, 
+        mutation_rate=args.mutation_rate,
+    )
+
+    rows, cols = 1, 2
+    fig, axs = plt.subplots(
+        rows, cols, figsize=(cols * 4, rows * 3),
+        constrained_layout=True, sharex=True, sharey=True,
+        squeeze=False,
+    )
+
+    axs[0, 0].set_title("MCMC")
+    axs[0, 0].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, true_obs, 
+        "-o", color="black", markersize=2, label="true",
+    )
+    axs[0, 0].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, relate_exp, 
+        "-o", color="red", markersize=2, alpha=0.5, label="branch",
+    )
+    axs[0, 0].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, relate_obs, 
+        "-o", color="blue", markersize=2, alpha=0.5, label="site",
+    )
+    axs[0, 0].set_xscale("log")
+
+    axs[0, 1].set_title("EP")
+    axs[0, 1].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, true_obs, 
+        "-o", color="black", markersize=2, label="true",
+    )
+    axs[0, 1].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, ep_exp, 
+        "-o", color="red", markersize=2, alpha=0.5, label="branch",
+    )
+    axs[0, 1].plot(
+        time_windows[:-1]/2 + time_windows[1:]/2, ep_obs, 
+        "-o", color="blue", markersize=2, alpha=0.5, label="site",
+    )
+    axs[0, 1].set_xscale("log")
+
+    fig.supylabel("# segregating sites")
+    fig.supxlabel("Time ago")
+    fig.suptitle(simulation_info, size=10)
+    plt.savefig(f"{plot_path}/segsites-over-time.png")
+    plt.clf()
